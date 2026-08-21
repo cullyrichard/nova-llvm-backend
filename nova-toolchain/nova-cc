@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# nova-cc: compile one or more C source files to a runnable dgasm program
+# for the base Data General Nova (nova1/nova3/nova4), using the same
+# LLVM backend as the sibling eclipse-llvm-backend project, extended
+# with a subtarget feature (FeatureEIS, see Eclipse.td) that gates the
+# Eclipse-only IOR/XOR instructions and synthesizes them from COM/AND
+# instead when targeting a base Nova CPU. See NOVA_PORTING_NOTES.md for
+# the full story (what's Nova-compatible, what was verified, what
+# wasn't).
+#
+# Usage: nova-cc [-t nova1|nova3|nova4|eclipse_s140] [-o out.simh] file.c [file.c ...]
+# Default CPU: nova3.
+#
+# Pipeline: identical to eclipse-cc's (clang -cc1 -> llvm-link ->
+# opt -internalize,globaldce -> llc -mcpu=<cpu> -> reorder_asm.py ->
+# dgasm -t <cpu>) — see eclipse-cc's own header comment for the full
+# reasoning behind each stage, none of which changed here. The only
+# difference is threading a CPU selection through to llc and dgasm
+# instead of hardcoding eclipse_s140.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLVM_BUILD="${LLVM_BUILD:-$HOME/nova-dev/llvm-build}"
+CLANG="$LLVM_BUILD/bin/clang"
+LLC="$LLVM_BUILD/bin/llc"
+LLVM_LINK="$LLVM_BUILD/bin/llvm-link"
+OPT="$LLVM_BUILD/bin/opt"
+RT_SRC="$SCRIPT_DIR/rt/eclipse_rt.c"
+REORDER="$SCRIPT_DIR/reorder_asm.py"
+TRIPLE="eclipse-dg-none"
+RESOURCE_DIR="$("$CLANG" -print-resource-dir)"
+
+cpu="nova3"
+out="a.simh"
+sources=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t) cpu="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    *) sources+=("$1"); shift ;;
+  esac
+done
+
+case "$cpu" in
+  nova1|nova3|nova4|eclipse_s140) ;;
+  *) echo "nova-cc: unknown -t '$cpu' (expected nova1, nova3, nova4, or eclipse_s140)" >&2; exit 1 ;;
+esac
+
+if [ ${#sources[@]} -eq 0 ]; then
+  echo "nova-cc: no input files" >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+ll_files=()
+
+compile_one() {
+  local src="$1" base ll
+  base="$(basename "${src%.*}")"
+  ll="$work/${base}.ll"
+  "$CLANG" -cc1 -triple "$TRIPLE" -nostdsysteminc \
+    -isystem "$RESOURCE_DIR/include" \
+    -I "$SCRIPT_DIR/rt/include" -I "$SCRIPT_DIR/rt" \
+    -emit-llvm "$src" -o "$ll"
+  ll_files+=("$ll")
+}
+
+for src in "${sources[@]}"; do
+  compile_one "$src"
+done
+compile_one "$RT_SRC"
+
+merged="$work/merged.ll"
+"$LLVM_LINK" -S "${ll_files[@]}" -o "$merged"
+
+# See eclipse-cc's own comment on this same retry loop — identical
+# reasoning, just with -mcpu/-t threaded through to llc/dgasm here.
+build_and_assemble() {
+  local pub_api="$1"
+  local stripped="$work/stripped.ll"
+  "$OPT" -S -passes="internalize,globaldce" \
+    -internalize-public-api-list="$pub_api" \
+    "$merged" -o "$stripped"
+
+  local asm="$work/out.s"
+  "$LLC" -mtriple="$TRIPLE" -mcpu="$cpu" -filetype=asm "$stripped" -o "$asm"
+
+  local reordered="$work/out_r.s"
+  python3 "$REORDER" "$asm" "$reordered"
+
+  dgasm -t "$cpu" -f simh -o "$out" "$reordered"
+}
+
+protected="main"
+pass=1
+while :; do
+  rm -f "$out"
+  output="$(build_and_assemble "$protected" 2>&1)" || true
+  if [ -f "$out" ]; then
+    echo "$output"
+    break
+  fi
+  missing="$(echo "$output" | grep -oE 'Undefined symbol: __[A-Za-z0-9_]+' \
+             | sed 's/Undefined symbol: //' | sort -u)" || true
+  new="$(comm -23 <(echo "$missing") <(echo "$protected" | tr ',' '\n' | sort -u))" || true
+  if [ -z "$new" ] || [ "$pass" -ge 15 ]; then
+    echo "nova-cc: dgasm failed:" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  echo "nova-cc: retrying with $(echo "$new" | tr '\n' ' ')protected (needed by this program)" >&2
+  protected="$protected,$(echo "$new" | tr '\n' ',' | sed 's/,$//')"
+  pass=$((pass + 1))
+done
+
+echo "nova-cc: wrote $out (target: $cpu)"
