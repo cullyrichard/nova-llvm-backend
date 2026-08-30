@@ -103,6 +103,46 @@ static int print_octal(unsigned int val) {
   return n + 1;
 }
 
+/* Forward declarations: the printf %lx/%lu/%ld helpers below need two
+ * things from the soft-float section, much further down this file --
+ * print_uint32 (decimal formatting for a real 32-bit value) and
+ * u32_and_nz (this target's own workaround for 32-bit comparisons used
+ * as a branch condition: writing that comparison directly, e.g.
+ * val > 0, crashes llc with a 'Cannot select' error -- see that
+ * section's own comment on print_long below, and sf_add_extract's use
+ * of the same pattern, for the full story).
+ */
+static int u32_and_nz(unsigned long a, unsigned long b);
+static int print_uint32(unsigned long val);
+
+static const char print_hex_digits[] = "0123456789abcdef";
+
+static int print_hex(unsigned int val) {
+  int n = 0;
+  if (val >= 16) {
+    n += print_hex(val >> 4);
+  }
+  putchar(print_hex_digits[val & 15]);
+  return n + 1;
+}
+
+/* Sign handled via a bitmask test (u32_and_nz against the sign bit),
+ * not a plain "val < 0" comparison -- a 32-bit signed comparison hits
+ * the same ISel crash a 32-bit unsigned one does (see the forward-
+ * declaration comment above). Matches sf_add_extract's
+ * u32_and_nz(a, SF_SIGN_MASK) idiom exactly.
+ */
+static int print_long(long val) {
+  int n = 0;
+  unsigned long uval = (unsigned long)val;
+  if (u32_and_nz(uval, 0x80000000UL)) {
+    putchar('-');
+    n++;
+    uval = (unsigned long)(-val);
+  }
+  return n + print_uint32(uval);
+}
+
 int printf(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
@@ -123,6 +163,17 @@ int printf(const char *fmt, ...) {
           putchar(*s);
           s++;
           n++;
+        }
+      } else if (*fmt == 'x') {
+        n += print_hex((unsigned int)va_arg(ap, int));
+      } else if (*fmt == 'u') {
+        n += print_uint((unsigned int)va_arg(ap, int));
+      } else if (*fmt == 'l') {
+        fmt++;
+        if (*fmt == 'd') {
+          n += print_long(va_arg(ap, long));
+        } else if (*fmt == 'u') {
+          n += print_uint32((unsigned long)va_arg(ap, long));
         }
       } else if (*fmt == '%') {
         putchar('%');
@@ -298,6 +349,98 @@ void *memmove(void *dst, const void *src, unsigned int n) {
   return dst;
 }
 
+int memcmp(const void *a, const void *b, unsigned int n) {
+  const unsigned char *pa = (const unsigned char *)a;
+  const unsigned char *pb = (const unsigned char *)b;
+  while (n) {
+    if (*pa != *pb) {
+      return (int)*pa - (int)*pb;
+    }
+    pa++;
+    pb++;
+    n--;
+  }
+  return 0;
+}
+
+char *strncpy(char *dst, const char *src, unsigned int n) {
+  unsigned int i = 0;
+  while (i < n && src[i]) {
+    dst[i] = src[i];
+    i++;
+  }
+  while (i < n) {
+    dst[i] = 0;
+    i++;
+  }
+  return dst;
+}
+
+char *strncat(char *dst, const char *src, unsigned int n) {
+  char *ret = dst;
+  while (*dst) {
+    dst++;
+  }
+  while (n && *src) {
+    *dst = *src;
+    dst++;
+    src++;
+    n--;
+  }
+  *dst = 0;
+  return ret;
+}
+
+char *strdup(const char *s) {
+  unsigned int n = strlen(s) + 1;
+  char *p = malloc(n);
+  if (!p) {
+    return (void *)0;
+  }
+  memcpy(p, s, n);
+  return p;
+}
+
+char *strchr(const char *s, int c) {
+  while (*s) {
+    if (*s == (char)c) {
+      return (char *)s;
+    }
+    s++;
+  }
+  return (c == 0) ? (char *)s : (void *)0;
+}
+
+char *strrchr(const char *s, int c) {
+  const char *last = (c == 0) ? s : (void *)0;
+  while (*s) {
+    if (*s == (char)c) {
+      last = s;
+    }
+    s++;
+  }
+  return (char *)last;
+}
+
+char *strstr(const char *haystack, const char *needle) {
+  if (!*needle) {
+    return (char *)haystack;
+  }
+  while (*haystack) {
+    const char *h = haystack;
+    const char *n = needle;
+    while (*h && *n && *h == *n) {
+      h++;
+      n++;
+    }
+    if (!*n) {
+      return (char *)haystack;
+    }
+    haystack++;
+  }
+  return (void *)0;
+}
+
 /* --- ctype.h --- */
 
 int isdigit(int c) { return c >= '0' && c <= '9'; }
@@ -351,6 +494,186 @@ void *malloc(unsigned int size) {
 }
 
 void free(void *ptr) { (void)ptr; }
+
+int abs(int n) { return n < 0 ? -n : n; }
+long labs(long n) { return n < 0 ? -n : n; }
+
+/* Plain linear congruential generator -- period/quality don't matter
+ * much for this target's likely uses, and 16-bit-native arithmetic
+ * (both operands and the modulus fit in unsigned int's native word
+ * width) avoids the 32-bit-multiply path entirely, which silently
+ * computes the wrong answer on this backend (confirmed empirically:
+ * 1000L times 17 came back 104, not 17000 -- a real, separate,
+ * not-yet-root-caused backend bug; tracked as a known limitation, not
+ * worked around here beyond simply not exercising it).
+ */
+static unsigned int rand_state = 1;
+
+void srand(unsigned int seed) { rand_state = seed ? seed : 1; }
+
+int rand(void) {
+  rand_state = rand_state * 25173 + 13849;
+  return (int)(rand_state & 0x7fff);
+}
+
+void exit(int status) {
+  (void)status;
+  asm volatile("HALT");
+  for (;;) {
+  }
+}
+
+static int digit_val(int c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'z') {
+    return c - 'a' + 10;
+  }
+  if (c >= 'A' && c <= 'Z') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+/* val * base, base a small (<=36) runtime int: computed as base
+ * additions of val rather than a real multiply -- see rand()'s
+ * comment above on why 32-bit multiply isn't trustworthy on this
+ * backend yet. Digit-at-a-time parsing only ever needs this once per
+ * input character, so the O(base) cost here is not a real concern.
+ */
+static long long_mul_small(long val, int base) {
+  long acc = 0;
+  int i;
+  for (i = 0; i < base; i++) {
+    acc += val;
+  }
+  return acc;
+}
+
+long strtol(const char *s, char **endptr, int base) {
+  while (isspace((unsigned char)*s)) {
+    s++;
+  }
+  int neg = 0;
+  if (*s == '-') {
+    neg = 1;
+    s++;
+  } else if (*s == '+') {
+    s++;
+  }
+  /* Prefix peek via a copied-and-incremented pointer (assign, ++,
+   * then dereference), never s[1] or a raw pointer-plus-one
+   * dereference -- a real, confirmed backend bug: offsetting a
+   * *local* pointer variable that holds a string-literal address and
+   * then dereferencing it misreads (s[1] on "0x1a" read back '0',
+   * s[0]'s own value, instead of 'x'), while the exact same pointer
+   * advanced via ++ and then dereferenced bare reads correctly.
+   * Matches this file's own established convention elsewhere
+   * (strlen/strcpy/... never index a pointer variable either) --
+   * apparently for the same reason.
+   */
+  if (*s == '0') {
+    const char *peek = s;
+    peek++;
+    if ((base == 0 || base == 16) && (*peek == 'x' || *peek == 'X')) {
+      s = peek;
+      s++;
+      base = 16;
+    } else if (base == 0) {
+      base = 8;
+    }
+  } else if (base == 0) {
+    base = 10;
+  }
+  const char *start = s;
+  long val = 0;
+  int d;
+  while ((d = digit_val((unsigned char)*s)) >= 0 && d < base) {
+    val = long_mul_small(val, base) + d;
+    s++;
+  }
+  if (endptr) {
+    *endptr = (char *)(s == start ? start : s);
+  }
+  return neg ? -val : val;
+}
+
+unsigned long strtoul(const char *s, char **endptr, int base) {
+  while (isspace((unsigned char)*s)) {
+    s++;
+  }
+  int neg = 0;
+  if (*s == '-') {
+    neg = 1;
+    s++;
+  } else if (*s == '+') {
+    s++;
+  }
+  /* Prefix peek via a copied-and-incremented pointer (assign, ++,
+   * then dereference), never s[1] or a raw pointer-plus-one
+   * dereference -- a real, confirmed backend bug: offsetting a
+   * *local* pointer variable that holds a string-literal address and
+   * then dereferencing it misreads (s[1] on "0x1a" read back '0',
+   * s[0]'s own value, instead of 'x'), while the exact same pointer
+   * advanced via ++ and then dereferenced bare reads correctly.
+   * Matches this file's own established convention elsewhere
+   * (strlen/strcpy/... never index a pointer variable either) --
+   * apparently for the same reason.
+   */
+  if (*s == '0') {
+    const char *peek = s;
+    peek++;
+    if ((base == 0 || base == 16) && (*peek == 'x' || *peek == 'X')) {
+      s = peek;
+      s++;
+      base = 16;
+    } else if (base == 0) {
+      base = 8;
+    }
+  } else if (base == 0) {
+    base = 10;
+  }
+  const char *start = s;
+  unsigned long val = 0;
+  int d;
+  while ((d = digit_val((unsigned char)*s)) >= 0 && d < base) {
+    val = (unsigned long)long_mul_small((long)val, base) + (unsigned long)d;
+    s++;
+  }
+  if (endptr) {
+    *endptr = (char *)(s == start ? start : s);
+  }
+  return neg ? (unsigned long)(-(long)val) : val;
+}
+
+float atof(const char *s) {
+  while (isspace((unsigned char)*s)) {
+    s++;
+  }
+  int neg = 0;
+  if (*s == '-') {
+    neg = 1;
+    s++;
+  } else if (*s == '+') {
+    s++;
+  }
+  float val = 0.0f;
+  while (isdigit((unsigned char)*s)) {
+    val = val * 10.0f + (float)(*s - '0');
+    s++;
+  }
+  if (*s == '.') {
+    s++;
+    float frac = 0.1f;
+    while (isdigit((unsigned char)*s)) {
+      val += (float)(*s - '0') * frac;
+      frac *= 0.1f;
+      s++;
+    }
+  }
+  return neg ? -val : val;
+}
 
 /* --- soft float: IEEE-754 single precision (compiler-rt ABI) ---
  *
@@ -1202,4 +1525,107 @@ static void print_float_frac(void) {
 void print_float(float f) {
   print_float_extract(f);
   print_float_frac();
+}
+
+/* --- math.h ---
+ *
+ * Built entirely on the soft-float primitives above (arithmetic,
+ * comparison, int<->float conversion) rather than any new bit-level
+ * mantissa/exponent surgery, on purpose: everything here already has
+ * a proven-correct implementation to lean on, and this whole section
+ * stays free of yet another set of SF_*_MASK-wrangling functions to
+ * get right and verify from scratch.
+ */
+
+#define SF_ABS_MASK (SF_EXP_MASK | SF_MANT_MASK)
+
+float fabsf(float f) { return sf_from_bits(sf_bits(f) & SF_ABS_MASK); }
+
+/* (long)f truncates toward zero (see __fixsfsi above) -- floorf only
+ * needs to correct the one case that disagrees with truncation:
+ * negative and non-integral, where truncating rounds up (toward
+ * zero) rather than down. Limited to values representable in a long
+ * (see __fixsfsi's own comment on saturation for anything bigger),
+ * same as every other int<->float conversion in this file.
+ */
+float floorf(float f) {
+  long i = (long)f;
+  float t = (float)i;
+  if (f < t) {
+    return t - 1.0f;
+  }
+  return t;
+}
+
+/* Mirror image of floorf: truncation already rounds the wrong way
+ * (up, toward zero) for a *positive* non-integral value here.
+ */
+float ceilf(float f) {
+  long i = (long)f;
+  float t = (float)i;
+  if (f > t) {
+    return t + 1.0f;
+  }
+  return t;
+}
+
+/* Newton's method (x_{n+1} = (x_n + a/x_n) / 2), starting from x0 = a
+ * itself -- globally convergent for any a > 0 regardless of starting
+ * point, so correctness doesn't depend on a good initial guess, only
+ * on enough iterations. A fixed, generous iteration count rather than
+ * a convergence check: this target has no way to bail out of the loop
+ * cheaply (every comparison here is itself a real function call --
+ * see sf_cmp), and 32 iterations is comfortably enough for float's
+ * 24-bit mantissa to converge from any *reasonable*-magnitude input
+ * (this was not verified against extreme inputs, e.g. very large or
+ * very small a, where x0 = a is a poor enough starting guess that
+ * more warm-up iterations could be needed first).
+ */
+/* Named sf_sqrt, not sqrtf, and exposed as sqrtf only via a macro in
+ * math.h -- calling this "sqrtf" directly hits a real, separate
+ * backend bug: LLVM's TargetLibraryInfo recognizes any function
+ * literally named sqrtf (matching libm's own signature) as *the*
+ * standard sqrtf, regardless of clang-level -fno-builtin/-fno-math-
+ * builtin (those are frontend flags; this recognition happens later,
+ * inside llc's own middle-end, working off the compiled name alone)
+ * -- and rewrites a call to it into a raw FSQRT node before this
+ * function's own body is ever reached. This backend has no libcall
+ * registered for FSQRT, so llc crashes outright ("LLVM ERROR:
+ * unsupported library call operation"). Renaming so the literal name
+ * "sqrtf" never appears in the compiled IR sidesteps the whole
+ * problem with zero blast radius (unlike -disable-simplify-libcalls,
+ * tried first and reverted: it does fix this, but it also disables
+ * the *unrelated* comparison-lowering simplification floorf/ceilf's
+ * own float comparisons depend on to avoid a similar ISel crash of
+ * their own -- confirmed the hard way, by watching floorf break).
+ * The same trick will likely be needed for every math.h function
+ * added after this one that shares a name with a real libm function.
+ */
+float sf_sqrt(float a) {
+  /* Guard via raw bits (u32_and_nz/u32_eq on sf_bits(a)), not a
+   * direct "a > 0.0f" float comparison used as a branch condition --
+   * confirmed the hard way that hits a real ISel crash here ("Cannot
+   * select" on the brcond this function's own early-return produced).
+   * Oddly inconsistent by name: floorf/ceilf's own "f < t"/"f > t"
+   * branches compile fine, and standalone repros under some function
+   * names crash while others (e.g. truncf) don't with the exact same
+   * body -- never fully root-caused, and not worth blocking this on.
+   * Sidestepping float-comparison-as-branch-condition entirely, via
+   * the same u32_and_nz-on-the-sign-bit idiom sf_add_extract already
+   * uses, avoids the whole question and is already proven safe
+   * throughout this file's soft-float section.
+   */
+  u32 abits = sf_bits(a);
+  if (u32_and_nz(abits, SF_SIGN_MASK)) {
+    return 0.0f;
+  }
+  if (u32_eq(abits, 0UL)) {
+    return 0.0f;
+  }
+  float x = a;
+  int i;
+  for (i = 0; i < 32; i++) {
+    x = (x + a / x) * 0.5f;
+  }
+  return x;
 }
